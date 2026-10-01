@@ -1,12 +1,13 @@
 pub mod core;
 
 use after_effects as ae;
-use core::{IRect, Mapping, OutputMode, Rgba, ScalerCfg, Scaled};
+use core::{IRect, Mapping, OutputMode, Rgba, ScalerCfg, ShrinkSampling};
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 enum Params {
     Factor,
     Output,
+    ShrinkSampling,
     EqualColorTolerance,
     AdvancedStart,
     CenterDirectionBias,
@@ -16,7 +17,8 @@ enum Params {
 }
 
 const FACTOR_OPTIONS: &[&str] = &["2x", "3x", "4x", "5x", "6x"];
-const OUTPUT_OPTIONS: &[&str] = &["Expand", "Keep Size"];
+const OUTPUT_OPTIONS: &[&str] = &["Expand", "Keep Size", "Shrink"];
+const SHRINK_OPTIONS: &[&str] = &["Nearest", "Average"];
 
 #[derive(Default)]
 struct Plugin {}
@@ -25,7 +27,6 @@ ae::define_effect!(Plugin, (), Params);
 
 #[derive(Clone, Debug)]
 struct RenderPlan {
-    factor: usize,
     cfg: ScalerCfg,
     map: Mapping,
     output_rect: IRect,
@@ -60,8 +61,13 @@ fn slider_value(params: &ae::Parameters<Params>, id: Params) -> Result<f64, Erro
 fn read_settings(params: &ae::Parameters<Params>) -> Result<(usize, OutputMode, ScalerCfg), Error> {
     let factor = core::FACTOR_MIN + (params.get(Params::Factor)?.as_popup()?.value() as usize).saturating_sub(1);
     let factor = factor.clamp(core::FACTOR_MIN, core::FACTOR_MAX);
+    let sampling = match params.get(Params::ShrinkSampling)?.as_popup()?.value() {
+        2 => ShrinkSampling::Average,
+        _ => ShrinkSampling::Nearest,
+    };
     let mode = match params.get(Params::Output)?.as_popup()?.value() {
         2 => OutputMode::KeepSize,
+        3 => OutputMode::Shrink(sampling),
         _ => OutputMode::Expand,
     };
     let cfg = ScalerCfg {
@@ -96,6 +102,11 @@ impl AdobePluginGlobal for Plugin {
         }))?;
         params.add(Params::Output, "Output", ae::PopupDef::setup(|f| {
             f.set_options(OUTPUT_OPTIONS);
+            f.set_default(1);
+            f.set_value(f.default());
+        }))?;
+        params.add(Params::ShrinkSampling, "Shrink Sampling", ae::PopupDef::setup(|f| {
+            f.set_options(SHRINK_OPTIONS);
             f.set_default(1);
             f.set_value(f.default());
         }))?;
@@ -143,7 +154,7 @@ impl AdobePluginGlobal for Plugin {
                 let output_rect = map.output_rect(input_rect).intersect(&req_rect);
                 extra.set_result_rect(to_ae_rect(output_rect));
                 extra.set_max_result_rect(to_ae_rect(map.output_rect(input_max)));
-                extra.set_pre_render_data(RenderPlan { factor, cfg, map, output_rect });
+                extra.set_pre_render_data(RenderPlan { cfg, map, output_rect });
             }
             ae::Command::SmartRender { extra } => {
                 let Some(plan) = extra.pre_render_data::<RenderPlan>().cloned() else {
@@ -278,12 +289,11 @@ fn render(plan: &RenderPlan, depth: Depth, input: &ae::Layer, output: &mut ae::L
         return clear(depth, output);
     }
     let src = read_input(input, depth)?;
-    let pixels = core::xbrz_scale(plan.factor, &plan.cfg, &src, w, h);
 
     // Locate worlds by origin_x/y: the input world may be larger than the checkout result_rect.
     let in_origin = input.origin();
     let in_rect = IRect { left: in_origin.h, top: in_origin.v, right: in_origin.h + w as i32, bottom: in_origin.v + h as i32 };
-    let scaled = Scaled::new(pixels, w, h, in_rect, &plan.map);
+    let scaled = core::upscale(&plan.map, &plan.cfg, &src, in_rect);
 
     let out_origin = output.origin();
     let (ox, oy) = (out_origin.h, out_origin.v);

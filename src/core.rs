@@ -67,12 +67,28 @@ impl IRect {
     pub fn inflate(&self, d: i32) -> IRect {
         IRect { left: self.left - d, top: self.top - d, right: self.right + d, bottom: self.bottom + d }
     }
+    pub fn scale(&self, f: i32) -> IRect {
+        IRect { left: self.left * f, top: self.top * f, right: self.right * f, bottom: self.bottom * f }
+    }
+    pub fn width(&self) -> i32 {
+        (self.right - self.left).max(0)
+    }
+    pub fn height(&self) -> i32 {
+        (self.bottom - self.top).max(0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputMode {
     Expand,
     KeepSize,
+    Shrink(ShrinkSampling),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShrinkSampling {
+    Nearest,
+    Average,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +107,7 @@ impl Mapping {
                 (center_x * (1.0 - f as f64)).round() as i32,
                 (center_y * (1.0 - f as f64)).round() as i32,
             ),
-            OutputMode::KeepSize => (0, 0),
+            OutputMode::KeepSize | OutputMode::Shrink(_) => (0, 0),
         };
         Self { factor: f, mode, offset_x, offset_y }
     }
@@ -108,6 +124,16 @@ impl Mapping {
                 bottom: self.offset_y + self.factor * input.bottom,
             },
             OutputMode::KeepSize => input,
+            OutputMode::Shrink(_) => self.block_rect(input).scale(self.factor),
+        }
+    }
+
+    pub fn block_rect(&self, r: IRect) -> IRect {
+        IRect {
+            left: r.left.div_euclid(self.factor),
+            top: r.top.div_euclid(self.factor),
+            right: div_ceil(r.right, self.factor),
+            bottom: div_ceil(r.bottom, self.factor),
         }
     }
 
@@ -123,6 +149,7 @@ impl Mapping {
                 bottom: div_ceil(output.bottom - self.offset_y, self.factor),
             },
             OutputMode::KeepSize => output,
+            OutputMode::Shrink(_) => return self.block_rect(output).inflate(SOURCE_MARGIN).scale(self.factor),
         };
         needed.inflate(SOURCE_MARGIN)
     }
@@ -211,6 +238,66 @@ pub fn pack_u8(a: u8, r: u8, g: u8, b: u8) -> u32 {
     (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
 
+pub fn shrink(src: &[u32], rect: IRect, factor: i32, sampling: ShrinkSampling) -> (Vec<u32>, IRect) {
+    let blocks = IRect {
+        left: rect.left.div_euclid(factor),
+        top: rect.top.div_euclid(factor),
+        right: div_ceil(rect.right, factor),
+        bottom: div_ceil(rect.bottom, factor),
+    };
+    let w = rect.width();
+    let at = |x: i32, y: i32| src[((y - rect.top) * w + (x - rect.left)) as usize];
+    let mut out = Vec::with_capacity((blocks.width() * blocks.height()) as usize);
+    for by in blocks.top..blocks.bottom {
+        let ys = (by * factor).max(rect.top)..(by * factor + factor).min(rect.bottom);
+        for bx in blocks.left..blocks.right {
+            let xs = (bx * factor).max(rect.left)..(bx * factor + factor).min(rect.right);
+            out.push(match sampling {
+                ShrinkSampling::Nearest => {
+                    let x = (bx * factor + factor / 2).clamp(xs.start, xs.end - 1);
+                    let y = (by * factor + factor / 2).clamp(ys.start, ys.end - 1);
+                    at(x, y)
+                }
+                ShrinkSampling::Average => {
+                    let (mut a, mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    for y in ys.clone() {
+                        for x in xs.clone() {
+                            let c = unpack(at(x, y));
+                            a += c.a;
+                            r += c.r * c.a;
+                            g += c.g * c.a;
+                            b += c.b * c.a;
+                            n += 1.0;
+                        }
+                    }
+                    if a <= 0.0 {
+                        0
+                    } else {
+                        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        pack_u8(q(a / n), q(r / a), q(g / a), q(b / a))
+                    }
+                }
+            });
+        }
+    }
+    (out, blocks)
+}
+
+pub fn upscale(map: &Mapping, cfg: &ScalerCfg, src: &[u32], rect: IRect) -> Scaled {
+    let factor = map.factor as usize;
+    match map.mode {
+        OutputMode::Shrink(sampling) => {
+            let (small, blocks) = shrink(src, rect, map.factor, sampling);
+            let (bw, bh) = (blocks.width() as usize, blocks.height() as usize);
+            Scaled::new(xbrz_scale(factor, cfg, &small, bw, bh), bw, bh, blocks, map)
+        }
+        OutputMode::Expand | OutputMode::KeepSize => {
+            let (w, h) = (rect.width() as usize, rect.height() as usize);
+            Scaled::new(xbrz_scale(factor, cfg, src, w, h), w, h, rect, map)
+        }
+    }
+}
+
 pub struct Scaled {
     pub pixels: Vec<u32>,
     pub width: i32,
@@ -227,6 +314,7 @@ impl Scaled {
         let (origin_x, origin_y) = match map.mode {
             OutputMode::Expand => (map.offset_x + f * input_rect.left, map.offset_y + f * input_rect.top),
             OutputMode::KeepSize => (input_rect.left, input_rect.top),
+            OutputMode::Shrink(_) => (f * input_rect.left, f * input_rect.top),
         };
         Self {
             pixels,
@@ -241,7 +329,7 @@ impl Scaled {
 
     pub fn sample(&self, x: i32, y: i32) -> Rgba {
         match self.mode {
-            OutputMode::Expand => {
+            OutputMode::Expand | OutputMode::Shrink(_) => {
                 let sx = x - self.origin_x;
                 let sy = y - self.origin_y;
                 if sx < 0 || sy < 0 || sx >= self.width || sy >= self.height {
@@ -359,34 +447,84 @@ mod tests {
                 palette[((s >> 16) % 4) as usize]
             })
             .collect();
-        let layer_rect = IRect { left: 0, top: 0, right: w, bottom: h };
         let cfg = ScalerCfg::default();
-        for (factor, mode) in [(2, OutputMode::Expand), (3, OutputMode::Expand), (5, OutputMode::Expand), (3, OutputMode::KeepSize)] {
-            let map = Mapping::new(factor, mode, w as f64 / 2.0, h as f64 / 2.0);
-            let full = Scaled::new(xbrz_scale(factor, &cfg, &layer, w as usize, h as usize), w as usize, h as usize, layer_rect, &map);
-            for req in [
-                IRect { left: 10, top: 7, right: 40, bottom: 30 },
-                IRect { left: -50, top: -40, right: -20, bottom: -5 },
-                IRect { left: 3, top: 3, right: 4, bottom: 4 },
-            ] {
-                let inp = map.input_rect_for(req).intersect(&layer_rect);
-                if inp.is_empty() {
-                    continue;
-                }
-                let (cw, ch) = ((inp.right - inp.left) as usize, (inp.bottom - inp.top) as usize);
-                let crop: Vec<u32> = (inp.top..inp.bottom)
-                    .flat_map(|y| (inp.left..inp.right).map(move |x| (y, x)))
-                    .map(|(y, x)| layer[(y * w + x) as usize])
-                    .collect();
-                let part = Scaled::new(xbrz_scale(factor, &cfg, &crop, cw, ch), cw, ch, inp, &map);
-                let out = map.output_rect(inp).intersect(&req);
-                for y in out.top..out.bottom {
-                    for x in out.left..out.right {
-                        assert_eq!(part.sample(x, y), full.sample(x, y), "factor {factor} {mode:?} req {req:?} at ({x},{y})");
+        let modes = [
+            (2, OutputMode::Expand),
+            (3, OutputMode::Expand),
+            (5, OutputMode::Expand),
+            (3, OutputMode::KeepSize),
+            (2, OutputMode::Shrink(ShrinkSampling::Nearest)),
+            (3, OutputMode::Shrink(ShrinkSampling::Average)),
+            (4, OutputMode::Shrink(ShrinkSampling::Nearest)),
+        ];
+        for (lx, ly) in [(0, 0), (-5, 2)] {
+            let layer_rect = IRect { left: lx, top: ly, right: lx + w, bottom: ly + h };
+            for (factor, mode) in modes {
+                let map = Mapping::new(factor, mode, w as f64 / 2.0, h as f64 / 2.0);
+                let full = upscale(&map, &cfg, &layer, layer_rect);
+                for req in [
+                    IRect { left: 10, top: 7, right: 40, bottom: 30 },
+                    IRect { left: -50, top: -40, right: -20, bottom: -5 },
+                    IRect { left: 3, top: 3, right: 4, bottom: 4 },
+                    IRect { left: -9, top: -3, right: 70, bottom: 60 },
+                ] {
+                    let inp = map.input_rect_for(req).intersect(&layer_rect);
+                    if inp.is_empty() {
+                        continue;
+                    }
+                    let crop: Vec<u32> = (inp.top..inp.bottom)
+                        .flat_map(|y| (inp.left..inp.right).map(move |x| (y, x)))
+                        .map(|(y, x)| layer[((y - ly) * w + (x - lx)) as usize])
+                        .collect();
+                    let part = upscale(&map, &cfg, &crop, inp);
+                    let out = map.output_rect(inp).intersect(&req);
+                    for y in out.top..out.bottom {
+                        for x in out.left..out.right {
+                            assert_eq!(part.sample(x, y), full.sample(x, y), "layer ({lx},{ly}) factor {factor} {mode:?} req {req:?} at ({x},{y})");
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn shrink_restores_nearest_enlarged_pixel_art() {
+        let (w0, h0) = (23i32, 17i32);
+        let palette = [pack_u8(255, 10, 10, 10), pack_u8(255, 240, 200, 60), pack_u8(128, 50, 90, 200), 0];
+        let mut s = 4242u32;
+        let small: Vec<u32> = (0..w0 * h0)
+            .map(|_| {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                palette[((s >> 16) % 4) as usize]
+            })
+            .collect();
+        let cfg = ScalerCfg::default();
+        for factor in FACTOR_MIN as i32..=FACTOR_MAX as i32 {
+            let (w, h) = (w0 * factor, h0 * factor);
+            let big: Vec<u32> = (0..w * h).map(|i| small[((i / w / factor) * w0 + (i % w) / factor) as usize]).collect();
+            let rect = IRect { left: 0, top: 0, right: w, bottom: h };
+            for sampling in [ShrinkSampling::Nearest, ShrinkSampling::Average] {
+                let (shrunk, blocks) = shrink(&big, rect, factor, sampling);
+                assert_eq!(blocks, IRect { left: 0, top: 0, right: w0, bottom: h0 });
+                assert_eq!(shrunk, small, "factor {factor} {sampling:?}");
+                let map = Mapping::new(factor as usize, OutputMode::Shrink(sampling), w as f64 / 2.0, h as f64 / 2.0);
+                assert_eq!(map.output_rect(rect), rect);
+                let out = upscale(&map, &cfg, &big, rect);
+                assert_eq!(out.pixels, xbrz_scale(factor as usize, &cfg, &small, w0 as usize, h0 as usize));
+            }
+        }
+    }
+
+    #[test]
+    fn shrink_partial_blocks_use_inside_pixels() {
+        let px: Vec<u32> = (0..5).map(|i| pack_u8(255, i as u8 * 10, 0, 0)).collect();
+        let rect = IRect { left: 3, top: 0, right: 8, bottom: 1 };
+        let (n, blocks) = shrink(&px, rect, 4, ShrinkSampling::Nearest);
+        assert_eq!(blocks, IRect { left: 0, top: 0, right: 2, bottom: 1 });
+        assert_eq!(n, vec![px[0], px[3]]);
+        let (a, _) = shrink(&px, rect, 4, ShrinkSampling::Average);
+        assert_eq!(a, vec![px[0], pack_u8(255, 25, 0, 0)]);
     }
 
     #[test]

@@ -42,3 +42,11 @@ expected values from `examples/verify.rs` (whole-image xBRZ, then crop / box fil
 - Whether real AE sets `PF_WorldFlag_DEEP` on float worlds (the reason `Layer::bit_depth` would misreport) is unknown; the plugin no longer depends on it.
 - Filed onmokoworks/AEXCompat#1727 (2026-10-02): host cannot request output outside the layer bounds, so the expanded area is never rendered there; also notes the whole-layer input world vs checkout result_rect observation.
 - Filed onmokoworks/AEXCompat#1728 for float worlds stamped with PF_WorldFlag_DEEP instead of RESERVED1 (2026-10-02).
+
+## 2026-10-02 Shrink mode
+
+- Added Output = Shrink: shrink 1/N on a grid anchored at layer (0,0), then xBRZ N×. Shrink Sampling = Nearest (block center, clamped into the part of the block inside the input) / Average (alpha-weighted, quantized to 8 bit before xBRZ).
+- New popup inserted at slot 3, so Color Tolerance moved to slot 4 and the advanced group to 5-9.
+- Unit tests: shrink of a nearest-enlarged image restores the original exactly (Nearest and Average, 2x-6x), partial edge blocks, cropped-input equivalence including a layer origin off the grid.
+- AEXCompat: 39/39 (adds Shrink Nearest 2/3/5x and Average 3x at 8/16/32 bpc, odd size, nearest-enlarged inputs). Exact at 8 and 32 bpc.
+- Not handled: at reduced preview resolution the grid is N preview pixels (coarser than Full).

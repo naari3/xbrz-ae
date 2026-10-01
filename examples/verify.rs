@@ -19,6 +19,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("gen") => generate(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap()),
+        Some("enlarge") => enlarge(&args[2], args[3].parse().unwrap(), &args[4]),
         Some("expect") => expect(&args[2..]),
         Some("cmp") => compare(&args[2..]),
         _ => {
@@ -64,14 +65,61 @@ fn generate(path: &str, w: u32, h: u32) {
     img.save(path).unwrap();
 }
 
+fn enlarge(input: &str, factor: u32, output: &str) {
+    let img = image::open(input).unwrap().to_rgba8();
+    image::imageops::resize(&img, img.width() * factor, img.height() * factor, image::imageops::FilterType::Nearest)
+        .save(output)
+        .unwrap();
+}
+
+#[derive(PartialEq)]
+enum Mode {
+    Expand,
+    Keep,
+    ShrinkNearest,
+    ShrinkAverage,
+}
+
+fn shrink_image(src: &[u32], w: i64, h: i64, f: i64, average: bool) -> (Vec<u32>, i64, i64) {
+    let (bw, bh) = ((w + f - 1) / f, (h + f - 1) / f);
+    let mut out = Vec::new();
+    for by in 0..bh {
+        for bx in 0..bw {
+            let (x0, y0, x1, y1) = (bx * f, by * f, ((bx + 1) * f).min(w), ((by + 1) * f).min(h));
+            if !average {
+                let (x, y) = ((x0 + f / 2).min(x1 - 1), (y0 + f / 2).min(y1 - 1));
+                out.push(src[(y * w + x) as usize]);
+                continue;
+            }
+            let (mut a, mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let c = unpack(src[(y * w + x) as usize]);
+                    a += c.a;
+                    r += c.r * c.a;
+                    g += c.g * c.a;
+                    b += c.b * c.a;
+                    n += 1.0;
+                }
+            }
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            out.push(if a <= 0.0 { 0 } else { pack_u8(q(a / n), q(r / a), q(g / a), q(b / a)) });
+        }
+    }
+    (out, bw, bh)
+}
+
 fn expect(a: &[String]) {
     let img = image::open(&a[0]).unwrap().to_rgba8();
     let factor: usize = a[1].parse().unwrap();
-    let keep = match a[2].as_str() {
-        "expand" => false,
-        "keep" => true,
+    let mode = match a[2].as_str() {
+        "expand" => Mode::Expand,
+        "keep" => Mode::Keep,
+        "shrink-nearest" => Mode::ShrinkNearest,
+        "shrink-average" => Mode::ShrinkAverage,
         m => panic!("mode {m}"),
     };
+    let keep = mode == Mode::Keep;
     let center_x: f64 = a[3].parse().unwrap();
     let center_y: f64 = a[4].parse().unwrap();
     let out_left: i64 = a[5].parse().unwrap();
@@ -82,16 +130,20 @@ fn expect(a: &[String]) {
 
     let (w, h) = (img.width() as i64, img.height() as i64);
     let src: Vec<u32> = img.pixels().map(|p| pack_u8(p[3], p[0], p[1], p[2])).collect();
-    let scaled = xbrz_scale(factor, &ScalerCfg::default(), &src, w as usize, h as usize);
     let f = factor as i64;
-    let (sw, sh) = (w * f, h * f);
+    let (base, bw, bh) = match mode {
+        Mode::ShrinkNearest => shrink_image(&src, w, h, f, false),
+        Mode::ShrinkAverage => shrink_image(&src, w, h, f, true),
+        _ => (src.clone(), w, h),
+    };
+    let scaled = xbrz_scale(factor, &ScalerCfg::default(), &base, bw as usize, bh as usize);
+    let (sw, sh) = (bw * f, bh * f);
 
-    let (off_x, off_y) = if keep {
+    let (off_x, off_y) = if mode != Mode::Expand {
         (0, 0)
     } else {
         ((center_x * (1.0 - f as f64)).round() as i64, (center_y * (1.0 - f as f64)).round() as i64)
     };
-    // Expected result_rect for request [0,w)x[0,h).
     let (l, t, r, b) = if keep { (0, 0, w, h) } else { (off_x, off_y, off_x + sw, off_y + sh) };
     println!(
         "expected_result_rect {} {} {} {}",

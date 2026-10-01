@@ -10,14 +10,16 @@ After Effects effect plugin that upscales pixel art with [xBRZ](https://sourcefo
 | Name | Description |
 |---|---|
 | Scale | 2x – 6x |
-| Output | **Expand**: output buffer becomes N× larger, scaled around the layer center. **Keep Size**: upscale with xBRZ, then box-filter back to the original size (smooths jaggies without changing size). |
+| Output | **Expand**: output buffer becomes N× larger, scaled around the layer center. **Keep Size**: upscale with xBRZ, then box-filter back to the original size (smooths jaggies without changing size). **Shrink**: shrink to 1/N on an N×N grid anchored at the layer origin, then upscale N× with xBRZ (same size; e.g. pixel art already enlarged with nearest neighbor). |
+| Shrink Sampling | Shrink mode only. **Nearest**: the pixel at the block center. **Average**: alpha-weighted block average. |
 | Color Tolerance | `equalColorTolerance` (default 30) |
 | Advanced | `centerDirectionBias` (4), `dominantDirectionThreshold` (3.6), `steepDirectionThreshold` (2.4) |
 
 Notes:
 - xBRZ works on 8-bit ARGB. In 16/32 bpc projects the input is quantized to 8 bit (values outside 0–1 in 32 bpc are clamped). Keep Size mode writes the box-filtered result at full output precision.
 - xBRZ treats outside of the image as transparent, so corners of an opaque full-frame layer get slightly rounded. This is upstream behavior.
-- At reduced preview resolution the downsampled image is fed to xBRZ, so the preview differs from Full.
+- At reduced preview resolution the downsampled image is fed to xBRZ, so the preview differs from Full. In Shrink mode the grid is N preview pixels, so the preview looks coarser than Full.
+- In Shrink mode, blocks cut by the layer edge use only the pixels inside the layer.
 
 ## Build
 

@@ -34,10 +34,15 @@ def find_key(o, key):
 
 
 def run_case(harness, name, image, depth, factor, mode, spatial=None, extra_assign=()):
-    w, h = map(int, image.stem.removeprefix("in").split("x"))
+    w, h = map(int, image.stem.split("_")[0].removeprefix("in").split("x"))
     req = {
         "schema_version": 1,
-        "assignments": [{"slot": 1, "value": factor - 1}, {"slot": 2, "value": 1 if mode == "expand" else 2}, *extra_assign],
+        "assignments": [
+            {"slot": 1, "value": factor - 1},
+            {"slot": 2, "value": {"expand": 1, "keep": 2}.get(mode, 3)},
+            {"slot": 3, "value": 2 if mode == "shrink-average" else 1},
+            *extra_assign,
+        ],
         "timing": {"frame": 0, "fps": 30},
     }
     full_w, full_h, ds = w, h, 1.0
@@ -105,16 +110,28 @@ def main():
         subprocess.run([str(VERIFY), "gen", str(WORK / f"in{size}.png"), *size.split("x")], check=True)
     img = WORK / "in64x48.png"
     odd = WORK / "in101x77.png"
+    subprocess.run([str(VERIFY), "gen", str(WORK / "in20x15.png"), "20", "15"], check=True)
+    enlarged = {}
+    for f in (2, 4):
+        enlarged[f] = WORK / f"in{20 * f}x{15 * f}_nn{f}.png"
+        subprocess.run([str(VERIFY), "enlarge", str(WORK / "in20x15.png"), str(f), str(enlarged[f])], check=True)
     cases = []
     for depth in (8, 16, 32):
         for f in (2, 3, 4, 6):
             cases.append((f"d{depth}_expand{f}", img, depth, f, "expand", None))
         for f in (2, 4):
             cases.append((f"d{depth}_keep{f}", img, depth, f, "keep", None))
+        for f in (2, 3, 5):
+            cases.append((f"d{depth}_shrink_nearest{f}", img, depth, f, "shrink-nearest", None))
+        cases.append((f"d{depth}_shrink_average3", img, depth, 3, "shrink-average", None))
     cases += [
         ("d8_odd_expand3", odd, 8, 3, "expand", None),
         ("d8_odd_expand2", odd, 8, 2, "expand", None),
         ("d8_odd_keep3", odd, 8, 3, "keep", None),
+        ("d8_odd_shrink_nearest4", odd, 8, 4, "shrink-nearest", None),
+        ("d8_odd_shrink_average3", odd, 8, 3, "shrink-average", None),
+        ("d8_nn2_shrink_nearest2", enlarged[2], 8, 2, "shrink-nearest", None),
+        ("d8_nn4_shrink_average4", enlarged[4], 8, 4, "shrink-average", None),
         # Half-resolution preview of a 130x100 layer: center must come from full size * downsample.
         ("d8_ds_half_expand3", img, 8, 3, "expand", (1, 2, 130, 100)),
         ("d32_ds_quarter_expand2", img, 32, 2, "expand", (1, 4, 260, 190)),
